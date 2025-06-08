@@ -9,6 +9,9 @@ from io import BytesIO # Added for file upload
 
 # Add the backend directory to sys.path to allow direct import of app
 import sys
+import importlib # Added for reloading module
+from backend.locust_scripts.locust_generic_test import GenericUser # Added for testing GenericUser
+from locust.env import Environment # Added for GenericUser instantiation
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app import app
@@ -260,6 +263,41 @@ class PerfServiceAPITestCase(unittest.TestCase):
         self.assertEqual(kwargs['env']['MY_VAR'], "my_value")
         self.assertIn("OTHER_VAR", kwargs['env'])
         self.assertEqual(kwargs['env']['OTHER_VAR'], "other_value")
+
+    def test_generic_user_host_attribute(self):
+        """
+        Tests that the GenericUser class correctly sets its host attribute
+        based on the TARGET_URL environment variable.
+        """
+        original_target_url = os.environ.get("TARGET_URL")
+
+        try:
+            # Case 1: TARGET_URL is set
+            expected_host_url = "https://my-test-target.com"
+            os.environ["TARGET_URL"] = expected_host_url
+
+            # Reload the module where GenericUser is defined to pick up the new env var
+            # This is crucial because the 'host' attribute is defined at class level
+            from backend.locust_scripts import locust_generic_test
+            importlib.reload(locust_generic_test)
+            env = Environment() # Create a dummy environment
+            user_with_env = locust_generic_test.GenericUser(environment=env)
+            self.assertEqual(user_with_env.host, expected_host_url)
+
+            # Case 2: TARGET_URL is not set (should use default)
+            del os.environ["TARGET_URL"]
+
+            # Reload the module again to pick up the absence of the env var
+            importlib.reload(locust_generic_test)
+            user_without_env = locust_generic_test.GenericUser(environment=env) # Use the same dummy env
+            self.assertEqual(user_without_env.host, "http://localhost:8080")
+
+        finally:
+            # Restore the original TARGET_URL environment variable if it existed
+            if original_target_url is not None:
+                os.environ["TARGET_URL"] = original_target_url
+            elif "TARGET_URL" in os.environ: # If it was set during the test but not originally
+                del os.environ["TARGET_URL"]
 
 
 if __name__ == '__main__':

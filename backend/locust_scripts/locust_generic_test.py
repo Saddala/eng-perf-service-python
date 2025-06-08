@@ -62,6 +62,7 @@ else:
 
 
 class GenericUser(*base_classes):
+    host = os.getenv("TARGET_URL", "http://localhost:8080")
     # wait_time is used by Locust's scheduler if no QPS plugin is active or if the plugin doesn't manage all tasks.
     # If ConstantQPSUserMixin is active, its internal timer dictates task execution frequency.
     # The mixin sets its own wait_time to None.
