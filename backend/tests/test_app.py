@@ -9,9 +9,11 @@ from io import BytesIO # Added for file upload
 
 # Add the backend directory to sys.path to allow direct import of app
 import sys
-import importlib # Added for reloading module
-from backend.locust_scripts.locust_generic_test import GenericUser # Added for testing GenericUser
-from locust.env import Environment # Added for GenericUser instantiation
+import importlib # Needed for reloading locust_generic_test
+# from backend.locust_scripts.locust_generic_test import GenericUser # We import the module instead
+from backend.locust_scripts import locust_generic_test # Import the module to reload
+from locust.env import Environment
+from locust.runners import LocalRunner # For dummy runner
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app import app
@@ -264,40 +266,140 @@ class PerfServiceAPITestCase(unittest.TestCase):
         self.assertIn("OTHER_VAR", kwargs['env'])
         self.assertEqual(kwargs['env']['OTHER_VAR'], "other_value")
 
-    def test_generic_user_host_attribute(self):
-        """
-        Tests that the GenericUser class correctly sets its host attribute
-        based on the TARGET_URL environment variable.
-        """
-        original_target_url = os.environ.get("TARGET_URL")
+    # The test_generic_user_host_attribute has been removed as the
+    # GenericUser.host attribute is no longer set directly via os.getenv
+    # within the class. It's now handled by Locust's HttpUser parent class
+    # and typically set via CLI --host or Environment(host=...).
 
-        try:
-            # Case 1: TARGET_URL is set
-            expected_host_url = "https://my-test-target.com"
-            os.environ["TARGET_URL"] = expected_host_url
 
-            # Reload the module where GenericUser is defined to pick up the new env var
-            # This is crucial because the 'host' attribute is defined at class level
-            from backend.locust_scripts import locust_generic_test
+# New Test Class for GenericUser request construction
+class TestGenericUserRequestConstruction(unittest.TestCase):
+    def setUp(self):
+        # Mock Locust Environment, common for all tests in this class
+        self.mock_env = Environment(host="http://envhost.com", events=MagicMock())
+        self.mock_env.runner = MagicMock(spec=LocalRunner)
+        self.mock_env.runner.client_id = "test_runner_client_01"
+
+        # It's good practice to ensure the module is in a known state before tests,
+        # but each test will reload it with a specific environment.
+        # We can reload here with some baseline defaults if necessary, or rely on
+        # the first test's patched reload. For safety, let's establish a baseline.
+        baseline_env = {
+            "TARGET_URL": "http://baseline.com", "ENDPOINT_PATH": "/baseline",
+            "REQUEST_METHOD": "GET", "HEADERS_STR": "{}", "PAYLOAD_STR": "{}",
+            "LOCUST_MODE": "generic", "TARGET_QPS_STR": "1",
+            "THINK_TIME_MIN_STR": "1", "THINK_TIME_MAX_STR": "1"
+        }
+        with patch.dict(os.environ, baseline_env, clear=True):
             importlib.reload(locust_generic_test)
-            env = Environment() # Create a dummy environment
-            user_with_env = locust_generic_test.GenericUser(environment=env)
-            self.assertEqual(user_with_env.host, expected_host_url)
 
-            # Case 2: TARGET_URL is not set (should use default)
-            del os.environ["TARGET_URL"]
+    def tearDown(self):
+        # Restore environment to a baseline state after each test,
+        # This helps ensure no leakage between test classes if os.environ was dirtied.
+        # The patch.dict in each test method handles restoration for that test's changes.
+        baseline_env = {
+            "TARGET_URL": "http://baseline.com", "ENDPOINT_PATH": "/baseline",
+            "REQUEST_METHOD": "GET", "HEADERS_STR": "{}", "PAYLOAD_STR": "{}",
+            "LOCUST_MODE": "generic", "TARGET_QPS_STR": "1",
+            "THINK_TIME_MIN_STR": "1", "THINK_TIME_MAX_STR": "1"
+        }
+        # For safety, clear out other test keys that might have been set if a test failed mid-patch
+        test_specific_keys = ["ENDPOINT_PATH", "REQUEST_METHOD", "HEADERS_STR", "PAYLOAD_STR"] # These are primary ones varied by tests
+        # However, patch.dict should handle this. The main goal of tearDown here is
+        # to reset locust_generic_test module's global state.
+        with patch.dict(os.environ, baseline_env, clear=True):
+             importlib.reload(locust_generic_test)
 
-            # Reload the module again to pick up the absence of the env var
+    def _get_configured_user_after_reload(self):
+        # Assumes locust_generic_test has just been reloaded by the caller (inside patch.dict context)
+        # Set class host directly for User instantiation as determined to be necessary
+        locust_generic_test.GenericUser.host = self.mock_env.host
+        user = locust_generic_test.GenericUser(environment=self.mock_env)
+        user.client = MagicMock()
+        user.client.host = self.mock_env.host
+        return user
+
+    def test_custom_get_request(self):
+        custom_endpoint = "/custom/api/get"
+        custom_headers_str = '{"X-Test-Header": "TestValue"}'
+        env_patch = {
+            "ENDPOINT_PATH": custom_endpoint,
+            "REQUEST_METHOD": "GET",
+            "HEADERS_STR": custom_headers_str,
+            # Required defaults for module reload
+            "PAYLOAD_STR": "{}", "LOCUST_MODE": "generic", "TARGET_URL": "http://log.com",
+            "TARGET_QPS_STR": "1", "THINK_TIME_MIN_STR": "1", "THINK_TIME_MAX_STR": "1"
+        }
+        with patch.dict(os.environ, env_patch, clear=True): # clear=True is important
             importlib.reload(locust_generic_test)
-            user_without_env = locust_generic_test.GenericUser(environment=env) # Use the same dummy env
-            self.assertEqual(user_without_env.host, "http://localhost:8080")
+            user = self._get_configured_user_after_reload()
+            user._perform_configured_request()
 
-        finally:
-            # Restore the original TARGET_URL environment variable if it existed
-            if original_target_url is not None:
-                os.environ["TARGET_URL"] = original_target_url
-            elif "TARGET_URL" in os.environ: # If it was set during the test but not originally
-                del os.environ["TARGET_URL"]
+        expected_headers = {"X-Test-Header": "TestValue"}
+        expected_name = f"GET_{custom_endpoint}"
+        user.client.get.assert_called_once_with(
+            custom_endpoint,
+            headers=expected_headers,
+            name=expected_name
+        )
+
+    def test_custom_post_request(self):
+        custom_endpoint = "/custom/api/post"
+        payload_dict = {"data": "test"}
+        payload_str = json.dumps(payload_dict)
+        custom_headers_str = '{"Content-Type": "application/json"}'
+
+        env_patch = {
+            "ENDPOINT_PATH": custom_endpoint,
+            "REQUEST_METHOD": "POST",
+            "PAYLOAD_STR": payload_str,
+            "HEADERS_STR": custom_headers_str,
+            # Required defaults for module reload
+            "LOCUST_MODE": "generic", "TARGET_URL": "http://log.com",
+            "TARGET_QPS_STR": "1", "THINK_TIME_MIN_STR": "1", "THINK_TIME_MAX_STR": "1"
+        }
+        with patch.dict(os.environ, env_patch, clear=True): # clear=True
+            importlib.reload(locust_generic_test)
+            user = self._get_configured_user_after_reload()
+            user._perform_configured_request()
+
+        expected_headers = {"Content-Type": "application/json"}
+        expected_name = f"POST_{custom_endpoint}"
+        user.client.post.assert_called_once_with(
+            custom_endpoint,
+            headers=expected_headers,
+            json=payload_dict,
+            name=expected_name
+        )
+
+    def test_default_get_request(self):
+        # Test that ENDPOINT_PATH uses its os.getenv default when not in the patch.
+        # Other necessary vars for module load are explicitly provided.
+        default_endpoint_in_script = "/default_path" # Expected default for ENDPOINT_PATH
+
+        env_patch = {
+            # ENDPOINT_PATH is deliberately omitted to test its default
+            "REQUEST_METHOD": "GET",
+            "HEADERS_STR": "{}", # Explicitly default for this test
+            "PAYLOAD_STR": "{}", # Explicitly default for this test
+            "LOCUST_MODE": "generic",
+            "TARGET_URL": "http://log.com",
+            "TARGET_QPS_STR": "1",
+            "THINK_TIME_MIN_STR": "1",
+            "THINK_TIME_MAX_STR": "1"
+        }
+
+        with patch.dict(os.environ, env_patch, clear=True):
+            importlib.reload(locust_generic_test)
+            user = self._get_configured_user_after_reload()
+            user._perform_configured_request()
+
+        expected_name = f"GET_{default_endpoint_in_script}"
+        user.client.get.assert_called_once_with(
+            default_endpoint_in_script,
+            headers={},
+            name=expected_name
+        )
 
 
 if __name__ == '__main__':
