@@ -29,83 +29,99 @@ def _start_test_run(test_type_from_url="generic"):
         app.logger.info(f"[{test_id}][{test_type_from_url}] Received form data: {request.form}")
         app.logger.info(f"[{test_id}][{test_type_from_url}] Received files: {request.files}")
 
-        # --- File Handling ---
-        env_vars_from_file = {}
-        saved_file_paths = {}
+        # --- File Handling & Environment Variable Preparation ---
+        locust_env = os.environ.copy()
+        form_data = request.form
 
+        # Handle envVarsFile first to merge into locust_env
         if 'envVarsFile' in request.files:
             file = request.files['envVarsFile']
             if file.filename != '':
                 filepath = os.path.join(test_run_dir, "env_vars_upload.json")
                 file.save(filepath)
-                saved_file_paths['ENV_VARS_FILE_PATH'] = filepath
                 app.logger.info(f"[{test_id}][{test_type_from_url}] Saved envVarsFile to {filepath}")
                 try:
                     with open(filepath, 'r') as f:
                         env_vars_from_file = json.load(f)
-                    if not isinstance(env_vars_from_file, dict):
+                    if isinstance(env_vars_from_file, dict):
+                        locust_env.update(env_vars_from_file)
+                    else:
                         app.logger.warning(f"[{test_id}][{test_type_from_url}] envVarsFile was not a JSON object. Ignoring.")
-                        env_vars_from_file = {}
                 except json.JSONDecodeError:
                     app.logger.warning(f"[{test_id}][{test_type_from_url}] Failed to parse envVarsFile as JSON. Ignoring.")
-                    env_vars_from_file = {}
                 except Exception as e:
                     app.logger.error(f"[{test_id}][{test_type_from_url}] Error processing envVarsFile: {e}")
-                    env_vars_from_file = {}
 
-        for file_key in ['dataFile', 'payloadTemplateFile']: # Add other expected file keys here
-            if file_key in request.files:
-                file = request.files[file_key]
-                if file.filename != '':
-                    filepath = os.path.join(test_run_dir, file.filename) # Using original filename
-                    file.save(filepath)
-                    saved_file_paths[file_key.upper() + '_PATH'] = filepath # e.g., DATA_FILE_PATH
-                    app.logger.info(f"[{test_id}][{test_type_from_url}] Saved {file_key} to {filepath}")
-
-        # --- Environment Variable Preparation ---
-        locust_env = os.environ.copy()
-        locust_env.update(env_vars_from_file)
-
-        form_data = request.form
+        # Basic env vars from form
         locust_env["TEST_ID"] = test_id
-        # TARGET_HOST and TARGET_PATH are better names for env vars used by the script
-        locust_env["TARGET_HOST"] = form_data.get("host", "http://localhost:8080")
-        locust_env["TARGET_PATH"] = form_data.get("url", "/")
-        locust_env["TARGET_URL"] = f"{locust_env['TARGET_HOST']}{locust_env['TARGET_PATH']}"
+        locust_env["TARGET_HOST"] = form_data.get("host", "http://localhost:8080") # Used for --host
+        locust_env["ENDPOINT"] = form_data.get("url", "/") # Renamed from TARGET_PATH
+        locust_env["METHOD"] = form_data.get("method", "GET").upper() # Renamed from REQUEST_METHOD
+        locust_env["HEADERS"] = form_data.get("headers", "{}") # This will be read by locust script
+        # QUERY_PARAMS is not standard in the new script, consider removing or adapting script
+        # locust_env["QUERY_PARAMS"] = form_data.get("query_params", "{}")
 
-        locust_env["REQUEST_METHOD"] = form_data.get("method", "GET").upper()
-        locust_env["HEADERS"] = form_data.get("headers", "{}")
-        locust_env["QUERY_PARAMS"] = form_data.get("query_params", "{}")
-        # PAYLOAD_STR is more descriptive for the Locust script
-        locust_env["PAYLOAD_STR"] = form_data.get("payload", form_data.get("inlinePayloadContent", "{}"))
+        # Handle PayloadType and PAYLOAD_TEMPLATE
+        payload_type_from_form = form_data.get("payloadType", "json").lower()
+        locust_env["PAYLOAD_TYPE"] = payload_type_from_form
+        inline_payload_types = ["json", "text", "form-urlencoded", "application/x-www-form-urlencoded"]
 
+        if 'payloadTemplateFile' in request.files and request.files['payloadTemplateFile'].filename != '':
+            file = request.files['payloadTemplateFile']
+            # Use a consistent name or make it unique if clashes are possible with dataFile
+            filename = "payload_template_from_file" + os.path.splitext(file.filename)[1] if file.filename else "payload_template_from_file.txt"
+            filepath = os.path.join(test_run_dir, filename)
+            file.save(filepath)
+            locust_env["PAYLOAD_TEMPLATE"] = filepath
+            app.logger.info(f"[{test_id}][{test_type_from_url}] Saved payloadTemplateFile to {filepath} and set as PAYLOAD_TEMPLATE.")
+        elif payload_type_from_form in inline_payload_types:
+            inline_payload_content = form_data.get("payload", form_data.get("inlinePayloadContent", ""))
+            temp_payload_filename = f"inline_payload_for_{test_id}.txt"
+            temp_payload_filepath = os.path.join(test_run_dir, temp_payload_filename)
+            with open(temp_payload_filepath, 'w') as f:
+                f.write(inline_payload_content)
+            locust_env["PAYLOAD_TEMPLATE"] = temp_payload_filepath
+            app.logger.info(f"[{test_id}][{test_type_from_url}] Saved inline payload to {temp_payload_filepath} and set as PAYLOAD_TEMPLATE.")
+        else:
+            app.logger.info(f"[{test_id}][{test_type_from_url}] No payloadTemplateFile uploaded and payloadType ('{payload_type_from_form}') is not for inline. PAYLOAD_TEMPLATE may not be set unless from envVarsFile.")
 
-        # Primary determination of LOCUST_MODE is from 'load_type' in form data
-        load_type_form = form_data.get("load_type", "RAMP_TEST").upper() # Default if not provided
+        # Handle dataFile
+        if 'dataFile' in request.files and request.files['dataFile'].filename != '':
+            file = request.files['dataFile']
+            # Using original filename, ensure it's sanitized if necessary, though os.path.join is safe
+            filepath = os.path.join(test_run_dir, file.filename)
+            file.save(filepath)
+            locust_env["DATA_FILE"] = filepath
+            app.logger.info(f"[{test_id}][{test_type_from_url}] Saved dataFile to {filepath}")
+
+        # Primary determination of LOCUST_MODE is from 'load_type' in form data (for QPS)
+        load_type_form = form_data.get("load_type", "RAMP_TEST").upper()
         app.logger.info(f"[{test_id}][{test_type_from_url}] load_type from form: {load_type_form}")
 
+        # TARGET_QPS is global in the new locust script, set via env var.
+        # LOCUST_MODE is not directly used by new script's GenericUser for QPS enabling,
+        # but QPS is enabled if TARGET_QPS > 0.
+        # We can still set TARGET_QPS env var based on form data.
         if load_type_form == "QPS_TEST":
-            locust_env["LOCUST_MODE"] = "constant_qps"
-            locust_env["TARGET_QPS"] = form_data.get("targetQps", "10")
+            locust_env["TARGET_QPS"] = form_data.get("targetQps", os.getenv("TARGET_QPS", "0")) # Get from form, fallback to existing env, then "0"
         else:
-            locust_env["LOCUST_MODE"] = "generic"
-            # Ensure TARGET_QPS is not inadvertently passed if not in QPS mode, or Locust script should ignore it
-            if "TARGET_QPS" in locust_env:
-                del locust_env["TARGET_QPS"]
+            # If not QPS_TEST, ensure TARGET_QPS is "0" or not set to disable QPS in script
+            locust_env["TARGET_QPS"] = "0"
+            # locust_env.pop("TARGET_QPS", None) # Alternative: remove it
 
-
-        for key, path in saved_file_paths.items():
-            locust_env[key] = path
-
-        locust_env["INFLUX_LINE_PROTOCOL_FILE_PATH"] = os.path.join(test_run_dir, "metrics.influx")
+        # INFLUX_LINE_PROTOCOL_FILE_PATH is not standard in new script.
+        # If needed, script must be adapted or this can be passed via envVarsFile.
+        # locust_env["INFLUX_LINE_PROTOCOL_FILE_PATH"] = os.path.join(test_run_dir, "metrics.influx")
 
         # --- Locust Command Construction ---
+        # Note: TARGET_HOST is now passed via --host
         cmd = [
             "locust",
             "-f", LOCUST_SCRIPT_PATH,
+            "--host", locust_env["TARGET_HOST"], # Added --host
             "--headless",
             "--logfile", os.path.join(test_run_dir, "locust.log"),
-            "--json",
+            "--json", # Ensure script outputting JSON stats if this is used for live results
             "--html", os.path.join(test_run_dir, "report.html")
         ]
 

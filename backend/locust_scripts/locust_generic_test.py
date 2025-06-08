@@ -1,271 +1,375 @@
-import os
-from locust import HttpUser, task, between, events
-from locust.runners import MasterRunner # Required for test_start/test_stop on master
+from locust import task, events, between # Import 'between' directly from locust
+from locust.contrib.fasthttp import FastHttpUser
+import os, csv, json, sys
+from string import Template
+from urllib.parse import urlencode
+from jsonpath_ng import jsonpath, parse
+import logging
 
-# --- Configuration from Environment Variables (Placeholders) ---
-# These will be read from environment variables passed by the Flask app
-FULL_TARGET_URL_FOR_LOGGING = os.getenv("TARGET_URL", "http://localhost:8080/default_path") # Default for local testing
-ENDPOINT_PATH = os.getenv("ENDPOINT_PATH", "/default_path") # Actual path for requests
-REQUEST_METHOD = os.getenv("REQUEST_METHOD", "GET")
-HEADERS_STR = os.getenv("HEADERS_STR", "{}") # e.g., '{"Content-Type":"application/json", "X-API-Key":"secret"}'
-PAYLOAD_STR = os.getenv("PAYLOAD_STR", "{}") # e.g., '{"key":"value"}'
-THINK_TIME_MIN_STR = os.getenv("THINK_TIME_MIN", "1") # Min wait time between tasks in seconds
-THINK_TIME_MAX_STR = os.getenv("THINK_TIME_MAX", "1") # Max wait time between tasks in seconds
-TEST_ID = os.getenv("TEST_ID", "default_test_run") # Unique ID for the test run
-LOCUST_MODE = os.getenv("LOCUST_MODE", "generic") # 'generic', 'constant_qps'
-TARGET_QPS_STR = os.getenv("TARGET_QPS", "10") # Target QPS for constant_qps mode
+# Get the absolute path of the directory containing this script.
+# This ensures it works regardless of the current working directory from which Locust is started.
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+# Add this directory to Python's system path if it's not already there.
+# This makes modules in this directory discoverable by absolute imports.
+if current_script_dir not in sys.path:
+    sys.path.insert(0, current_script_dir) # Insert at the beginning to give it priority
 
-# --- Parse Configuration ---
-try:
-    import json
-    HEADERS = json.loads(HEADERS_STR)
-    PAYLOAD = json.loads(PAYLOAD_STR) if PAYLOAD_STR else None # Original logic: if PAYLOAD_STR is "{}" -> PAYLOAD = {}
-    THINK_TIME_MIN = float(THINK_TIME_MIN_STR)
-    THINK_TIME_MAX = float(THINK_TIME_MAX_STR)
-    TARGET_QPS = int(TARGET_QPS_STR)
-except json.JSONDecodeError as e:
-    print(f"Error parsing JSON from environment variables: {e}") # Keep standard error print
-    HEADERS = {}
-    PAYLOAD = None
-    THINK_TIME_MIN = 1.0
-    THINK_TIME_MAX = 1.0
-    TARGET_QPS = 10
-except ValueError as e:
-    print(f"Error converting string to number from environment variables: {e}")
-    THINK_TIME_MIN = 1.0
-    THINK_TIME_MAX = 1.0
-    TARGET_QPS = 10
+# Now, use an absolute import for your plugin:
+from constant_throughput_plugin import ConstantThroughput
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Optional Constant Throughput Plugin Import ---
-ConstantQPSUserMixin = None
-if LOCUST_MODE == "constant_qps":
-    try:
-        from .constant_throughput_plugin import ConstantQPSUserMixin as PluginMixin
-        ConstantQPSUserMixin = PluginMixin # Assign to the name used later
-        print(f"Successfully imported ConstantQPSUserMixin. TARGET_QPS set to: {TARGET_QPS}")
-    except ImportError as e:
-        print(f"Error importing ConstantQPSUserMixin: {e}. Running generic user without QPS control.")
-        # ConstantQPSUserMixin will remain None, and GenericUser will not use it.
-    except Exception as e:
-        print(f"An unexpected error occurred during import of ConstantQPSUserMixin: {e}")
+# --- Configuration for Wait Time (Optional, mutually exclusive with ConstantThroughput) ---
+# If TARGET_QPS is set, this wait time will be overridden by ConstantThroughput logic.
+DEFAULT_WAIT_TIME_MIN = 1
+DEFAULT_WAIT_TIME_MAX = 2
+GLOBAL_TARGET_QPS = float(os.getenv("TARGET_QPS", 0)) # Define GLOBAL_TARGET_QPS here
 
+# --- Custom Event for JSONPath Metrics ---
+@events.init.add_listener
+def _locust_init_handler(environment, **kwargs): # Renamed _ to a more descriptive name for clarity
+    # Ensure environment.tags is a list (Locust typically ensures this, but good to be safe)
+    if not hasattr(environment, 'tags'):
+        environment.tags = []
 
-# Determine the base class for GenericUser
-# If QPS mode and plugin loaded, GenericUser will be (PluginMixin, HttpUser)
-# Otherwise, it will be just HttpUser
-base_classes = (HttpUser,)
-if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
-    base_classes = (ConstantQPSUserMixin, HttpUser)
-    print("GenericUser will be configured for Constant QPS mode.")
-else:
-    print("GenericUser will be configured for standard (non-QPS) mode.")
+    logger.info("Locust environment initialized.")
 
+    # Attach a separate, explicit function to the quitting event for clarity
+    # This event listener receives the environment instance as its argument
+    @environment.events.quitting.add_listener
+    def _locust_quitting_handler(environment, **quitting_kwargs): # Accept env and any other kwargs
+        logger.info("Locust is quitting. Performing final cleanup (if any).")
+        # You can add cleanup logic here, e.g., closing connections, writing final reports
 
-class GenericUser(*base_classes):
-    # host attribute is inherited from HttpUser or set via --host CLI argument.
-    # The old hardcoded host line has been removed.
-    # wait_time is used by Locust's scheduler if no QPS plugin is active or if the plugin doesn't manage all tasks.
-    # If ConstantQPSUserMixin is active, its internal timer dictates task execution frequency.
-    # The mixin sets its own wait_time to None.
-    # For non-QPS mode, this wait_time applies.
-    if not (LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin):
-        wait_time = between(THINK_TIME_MIN, THINK_TIME_MAX)
-    else:
-        # In QPS mode, the plugin handles timing. We might not need a Locust-scheduled task
-        # if the plugin's timer calls execute_main_task_for_qps directly.
-        # If we still have a @task, Locust might try to schedule it.
-        # The plugin sets wait_time = None on the user instance if it wants full control.
-        pass
+class GenericUser(FastHttpUser):
+    # Default wait time (will be overridden if TARGET_QPS is set)
+    wait_time_min = float(os.getenv("WAIT_TIME_MIN", DEFAULT_WAIT_TIME_MIN))
+    wait_time_max = float(os.getenv("WAIT_TIME_MAX", DEFAULT_WAIT_TIME_MAX))
+
+    # wait_time will be set in the __init__ method for dynamic calculation
+    wait_time = None
+
+    data_rows = []
+    payload_template = None
+    payload_type = None
+    endpoint = None
+    method = None
+    headers = {}
+    reuse_data = True
+    expected_json_path_values = {}
+    custom_metrics_json_paths = []
+
+    # Initialize wait_time in __init__ to access self.environment
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._load_test_config() # Load config first as it might be needed for wait_time setup
+        self._configure_wait_time()
 
 
-    def on_start(self):
-        """
-        Called when a User starts.
-        """
-        # Call super().on_start() to ensure mixin's on_start (if any) is called.
-        # This is crucial for ConstantQPSUserMixin to start its timer.
-        super().on_start() # Important for mixins like ConstantQPSUserMixin
+#     def _configure_wait_time(self):
+#         if GLOBAL_TARGET_QPS > 0:
+#             # If target QPS is set, use ConstantThroughput
+#             # Pass GLOBAL_TARGET_QPS and self.environment directly
+#             self.wait_time = ConstantThroughput(GLOBAL_TARGET_QPS, self.environment)
+#             # Log initial calculated per-user rate, but remind it's dynamic
+#             logger.info(f"Using ConstantThroughput with GLOBAL_TARGET_QPS: {GLOBAL_TARGET_QPS}. Per-user rate will dynamically adjust.")
+#             logger.warning("WAIT_TIME_MIN and WAIT_TIME_MAX environment variables will be ignored when TARGET_QPS is set.")
+#         else:
+#             # Otherwise, use the configured wait_time_min/max
+#             self.wait_time = between(self.wait_time_min, self.wait_time_max)
+#             logger.info(f"Using standard wait time: between({self.wait_time_min}, {self.wait_time_max}) seconds.")
 
-        print(f"GenericUser instance started. User ID: {self._user_id_for_logging()}")
-        print(f"  (Host will be: {self.host} from --host CLI or User.host attribute)")
-        print(f"  ENDPOINT_PATH: {ENDPOINT_PATH}, METHOD: {REQUEST_METHOD}")
-        if PAYLOAD:
-            print(f"  Payload: {PAYLOAD}")
-        print(f"  (Full example URL for logging was: {FULL_TARGET_URL_FOR_LOGGING})")
-
-        if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
-            print(f"  Mode: Constant QPS (Target: {TARGET_QPS} QPS per user)")
-            if not hasattr(self, 'execute_main_task_for_qps'):
-                print("  ERROR: ConstantQPSUserMixin is active, but 'execute_main_task_for_qps' is not defined in GenericUser!")
+    @classmethod
+    def _configure_wait_time(cls):
+        if GLOBAL_TARGET_QPS > 0:
+            cls.wait_time = ConstantThroughput(GLOBAL_TARGET_QPS, None)  # Env gets injected later
+            # Log initial calculated per-user rate, but remind it's dynamic
+            logger.info(f"Using ConstantThroughput with GLOBAL_TARGET_QPS: {GLOBAL_TARGET_QPS}. Per-user rate will dynamically adjust.")
+            logger.warning("WAIT_TIME_MIN and WAIT_TIME_MAX environment variables will be ignored when TARGET_QPS is set.")
         else:
-            print(f"  Mode: Generic (Think time: {THINK_TIME_MIN}-{THINK_TIME_MAX}s)")
+            # Otherwise, use the configured wait_time_min/max
+            cls.wait_time = between(cls.wait_time_min, cls.wait_time_max)
+            logger.info(f"Using standard wait time: between({cls.wait_time_min}, {cls.wait_time_max}) seconds.")
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls._configure_wait_time()
 
 
-    def _user_id_for_logging(self):
-        if self.environment and self.environment.runner:
-            return self.environment.runner.client_id
-        return "local_user"
+    def _load_test_config(self):
+        data_file = os.getenv("DATA_FILE")
+        payload_template_path = os.getenv("PAYLOAD_TEMPLATE")
+        self.payload_type = os.getenv("PAYLOAD_TYPE", "json").lower()
+        self.endpoint = os.getenv("ENDPOINT", "/")
+        self.method = os.getenv("METHOD", "POST").upper()
+        headers_env = os.getenv("HEADERS")
+        self.reuse_data = os.getenv("REUSE_DATA", "true").lower() == "true"
 
-    # This method is specifically for the ConstantQPSUserMixin
-    def execute_main_task_for_qps(self):
-        """
-        This method is called by the ConstantQPSUserMixin's timer loop
-        at the specified QPS rate.
-        """
-        # print(f"User {self._user_id_for_logging()} executing QPS task via execute_main_task_for_qps.")
-        self._perform_configured_request()
+        # --- Error Handling for Headers ---
+        if headers_env:
+            try:
+                self.headers = json.loads(headers_env)
+                logger.info(f"Loaded custom headers: {self.headers}")
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse HEADERS environment variable as JSON. Value: '{headers_env}'")
+                self.headers = {} # Ensure it's an empty dict if parsing fails
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while parsing HEADERS: {e}")
+                self.headers = {}
 
-    def _perform_configured_request(self):
-        """
-        Helper method to make the actual HTTP request based on configuration.
-        Used by both QPS mode (via execute_main_task_for_qps) and generic @task.
-        """
-        request_name = f"{REQUEST_METHOD}_{ENDPOINT_PATH}" # Name uses the specific endpoint path
-        if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
-            request_name += "_QPS"
-
-        # self.client.get/post etc. will use self.host (from CLI or User.host) + ENDPOINT_PATH
-        if REQUEST_METHOD.upper() == "GET":
-            self.client.get(ENDPOINT_PATH, headers=HEADERS, name=request_name)
-        elif REQUEST_METHOD.upper() == "POST":
-            # For file uploads (multipart/form-data), PAYLOAD needs special handling.
-            # The current simple PAYLOAD_STR is for JSON.
-            # Actual file uploads would require self.client.post with 'files' parameter.
-            # This needs to be addressed when handling file uploads from Flask.
-            # For now, assuming JSON payload if POST.
-            self.client.post(ENDPOINT_PATH, headers=HEADERS, json=PAYLOAD, name=request_name)
-        # Add other methods (PUT, DELETE, etc.) as needed
+        # --- Error Handling for Data File ---
+        if not data_file:
+            logger.warning("DATA_FILE environment variable not set. No data will be used for requests.")
+        elif not os.path.exists(data_file):
+            logger.error(f"DATA_FILE '{data_file}' not found. Please check the path.")
+            if self.environment and self.environment.runner: # Check if runner exists
+                self.environment.runner.quit()
         else:
-            print(f"User {self._user_id_for_logging()}: Unsupported HTTP method: {REQUEST_METHOD}")
-            # Optionally, fire a failure event
-            if self.environment and self.environment.events:
-                self.environment.events.request.fire(
-                    request_type=REQUEST_METHOD,
-                    name=request_name,
-                    response_time=0,
-                    response_length=0,
-                    exception=NotImplementedError(f"Unsupported method: {REQUEST_METHOD} in GenericUser"),
-                    context=self.context(),
-                )
+            try:
+                if data_file.endswith(".csv"):
+                    with open(data_file, newline='') as f:
+                        self.data_rows = list(csv.DictReader(f))
+                    logger.info(f"Loaded {len(self.data_rows)} rows from CSV: {data_file}")
+                elif data_file.endswith(".json"):
+                    with open(data_file) as f:
+                        self.data_rows = json.load(f)
+                    logger.info(f"Loaded {len(self.data_rows)} entries from JSON: {data_file}")
+                else:
+                    logger.error(f"Unsupported data file type: {data_file}. Only .csv and .json are supported.")
+                    if self.environment and self.environment.runner: # Check if runner exists
+                        self.environment.runner.quit()
+            except Exception as e:
+                logger.error(f"Error loading data file '{data_file}': {e}")
+                if self.environment and self.environment.runner: # Check if runner exists
+                    self.environment.runner.quit()
+
+        # --- Error Handling for Payload Template ---
+        if not payload_template_path:
+            logger.warning("PAYLOAD_TEMPLATE environment variable not set. Requests will be sent without templated bodies.")
+            self.payload_template = Template("") # Empty template
+        elif not os.path.exists(payload_template_path):
+            logger.error(f"PAYLOAD_TEMPLATE '{payload_template_path}' not found. Please check the path.")
+            if self.environment and self.environment.runner: # Check if runner exists
+                self.environment.runner.quit()
+        else:
+            try:
+                with open(payload_template_path) as f:
+                    self.payload_template = Template(f.read())
+                logger.info(f"Loaded payload template from: {payload_template_path}")
+            except Exception as e:
+                logger.error(f"Error loading payload template '{payload_template_path}': {e}")
+                if self.environment and self.environment.runner: # Check if runner exists
+                    self.environment.runner.quit()
+
+        # --- Load JSONPath Assertions ---
+        expected_json_path_value_str = os.getenv("EXPECTED_JSON_PATH_VALUE")
+        if expected_json_path_value_str:
+            try:
+                self.expected_json_path_values = json.loads(expected_json_path_value_str)
+                logger.info(f"Loaded JSONPath assertions: {self.expected_json_path_values}")
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse EXPECTED_JSON_PATH_VALUE. Expected JSON string. Got: '{expected_json_path_value_str}'")
+            except Exception as e:
+                logger.error(f"Error processing EXPECTED_JSON_PATH_VALUE: {e}")
+
+        # --- Load Custom Metrics JSONPaths ---
+        custom_metrics_json_path_str = os.getenv("CUSTOM_METRICS_JSON_PATH")
+        if custom_metrics_json_path_str:
+            try:
+                self.custom_metrics_json_paths = json.loads(custom_metrics_json_path_str)
+                if not isinstance(self.custom_metrics_json_paths, list):
+                    logger.warning("CUSTOM_METRICS_JSON_PATH should be a JSON list of JSONPath strings. Ignoring.")
+                    self.custom_metrics_json_paths = []
+                logger.info(f"Loaded custom metrics JSONPaths: {self.custom_metrics_json_paths}")
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse CUSTOM_METRICS_JSON_PATH. Expected JSON list. Got: '{custom_metrics_json_path_str}'")
+            except Exception as e:
+                logger.error(f"Error processing CUSTOM_METRICS_JSON_PATH: {e}")
+
 
     @task
-    def make_request_if_not_qps(self):
-        """
-        This task is scheduled by Locust's default mechanism.
-        It should only execute if not in QPS mode (where the plugin's timer drives actions).
-        """
-        if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
-            # In QPS mode, ConstantQPSUserMixin's loop calls execute_main_task_for_qps.
-            # So, this Locust @task should do nothing to avoid duplicate requests or interference.
-            # print(f"User {self._user_id_for_logging()}: In QPS mode, make_request_if_not_qps is a no-op.")
-            pass
+    def execute_request(self):
+        current_data_row = {}
+        if self.data_rows:
+            try:
+                current_data_row = self.data_rows.pop(0)
+                if self.reuse_data:
+                    self.data_rows.append(current_data_row)
+            except IndexError:
+                logger.warning("Data rows exhausted. If REUSE_DATA is 'false', tasks may idle.")
+                return
+        elif not self.data_rows and (self.payload_template and "${" in self.payload_template.template): # Check if template exists before accessing .template
+            logger.warning("No data rows loaded, but payload template appears to expect variables. Request might fail or send incomplete data.")
+
+        # Ensure payload_template is not None before calling safe_substitute
+        body_str = self.payload_template.safe_substitute(current_data_row) if self.payload_template else ""
+
+        payload, content_type = self._prepare_payload(body_str)
+
+        full_headers = self.headers.copy()
+        if content_type: # Ensure content_type is not None before assigning
+            full_headers["Content-Type"] = content_type
+
+        req_method_name = self.method.lower()
+        if not hasattr(self.client, req_method_name):
+            logger.error(f"Unsupported HTTP method '{self.method}' for FastHttpUser client.")
+            return
+        req_method = getattr(self.client, req_method_name)
+
+        req_args = {
+            "headers": full_headers,
+            "name": self.endpoint, # Use endpoint as the default name for grouping in Locust stats
+            "catch_response": True, # FastHttpUser uses catch_response
+        }
+        if payload: # Ensure payload is not None or empty before updating
+            req_args.update(payload)
+
+        # For FastHttpUser, the path is the first argument.
+        # self.endpoint should be like "/api/users"
+        effective_endpoint = self.endpoint if self.endpoint.startswith("/") else "/" + self.endpoint
+
+        with req_method(effective_endpoint, **req_args) as response:
+            if 200 <= response.status_code < 300:
+                resp_content_type = response.headers.get("Content-Type", "").lower()
+
+                if "application/json" in resp_content_type:
+                    self._handle_json_response(response)
+                elif "text/" in resp_content_type or "application/xml" in resp_content_type:
+                    self._handle_text_response(response, resp_content_type)
+                elif "image/" in resp_content_type or "application/octet-stream" in resp_content_type or "application/pdf" in resp_content_type:
+                    self._handle_binary_response(response, resp_content_type)
+                elif response.status_code == 204: # No Content
+                    self._handle_no_content_response(response)
+                else:
+                    self._handle_unknown_content_type(response, resp_content_type)
+            else:
+                response.failure(f"❌ HTTP {response.status_code} - {response.text}")
+                logger.error(f"Request failed: {self.method} {effective_endpoint} - {response.status_code} - {response.text[:200]}")
+
+    def _handle_json_response(self, response):
+        is_success = True
+        failure_message = []
+        response_json = {}
+
+        try:
+            response_json = response.json()
+        except json.JSONDecodeError:
+            if self.expected_json_path_values or self.custom_metrics_json_paths:
+                is_success = False
+                failure_message.append("Response was not valid JSON, cannot apply JSONPath assertions/metrics.")
+        except Exception as e:
+            is_success = False
+            failure_message.append(f"Error parsing response JSON: {e}")
+
+        if is_success and self.expected_json_path_values and response_json:
+            for json_path_str, expected_value in self.expected_json_path_values.items():
+                try:
+                    jsonpath_expr = parse(json_path_str)
+                    matches = jsonpath_expr.find(response_json)
+                    if not matches:
+                        is_success = False
+                        failure_message.append(f"JSONPath '{json_path_str}' found no matches.")
+                        break
+                    actual_value = matches[0].value
+                    if actual_value != expected_value:
+                        is_success = False
+                        failure_message.append(f"JSONPath '{json_path_str}': Expected '{expected_value}', got '{actual_value}'.")
+                        break
+                except Exception as e:
+                    is_success = False
+                    failure_message.append(f"Error evaluating JSONPath '{json_path_str}': {e}")
+                    break
+
+        if is_success and self.custom_metrics_json_paths and response_json:
+            for json_path_str in self.custom_metrics_json_paths:
+                try:
+                    jsonpath_expr = parse(json_path_str)
+                    matches = jsonpath_expr.find(response_json)
+                    for match in matches:
+                        metric_name = f"jsonpath.{json_path_str.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '').strip('_')}"
+                        ctx = self.environment.context if self.environment and hasattr(self.environment, 'context') else {}
+                        events.request.fire(
+                            request_type="JSONPath_Metric",
+                            name=metric_name,
+                            response_time=match.value if isinstance(match.value, (int, float)) else 0,
+                            response_length=0,
+                            exception=None,
+                            context=ctx,
+                            response=response
+                        )
+                        logger.debug(f"Reported custom metric '{metric_name}': {match.value}")
+                except Exception as e:
+                    logger.error(f"Error extracting custom metric from JSONPath '{json_path_str}': {e}")
+
+        if is_success:
+            response.success()
         else:
-            # print(f"User {self._user_id_for_logging()}: Executing generic task make_request_if_not_qps.")
-            self._perform_configured_request()
+            failure_str = f"❌ JSON Assertion Failed: {' '.join(failure_message)}" if failure_message else "❌ Processing Failed"
+            response.failure(failure_str)
 
+    def _handle_text_response(self, response, content_type):
+        try:
+            text_content = response.text
+            if text_content:
+                response.success()
+                logger.info(f"{content_type}: Text response received (length: {len(text_content)})")
+            else:
+                response.failure(f"{content_type}: Empty text response.")
+        except Exception as e:
+            response.failure(f"{content_type}: Error processing text: {e} - Body: {response.text[:200]}...")
 
-    def on_stop(self):
-        """
-        Called when a User stops.
-        """
-        super().on_stop() # Important for mixins like ConstantQPSUserMixin to clean up
-        print(f"GenericUser instance stopped. User ID: {self._user_id_for_logging()}")
+    def _handle_binary_response(self, response, content_type):
+        binary_content = response.content
+        if len(binary_content) > 0:
+            logger.info(f"{content_type}: Binary data received (length: {len(binary_content)} bytes)")
+            response.success()
+        else:
+            response.failure(f"{content_type}: Empty binary response")
 
+    def _handle_no_content_response(self, response):
+        if not response.content:
+            logger.info("204 No Content: As expected")
+            response.success()
+        else:
+            response.failure(f"204 No Content: Unexpected body present. Length: {len(response.content)}")
 
-# --- Event Hooks for InfluxDB (Conceptual) ---
-# These hooks are executed by the master process when using distributed mode,
-# or by the local runner when running locally.
+    def _handle_unknown_content_type(self, response, content_type):
+        logger.warning(f"Unknown Content-Type ({content_type}) received for {self.method} {self.endpoint}. Status: {response.status_code}. Body: {response.text[:200]}...")
+        response.success()
 
-@events.test_start.add_listener
-def on_test_start(environment, **kwargs):
-    # This event is triggered when a new test is started.
-    # For distributed runs, this runs on the master node.
-    if not isinstance(environment.runner, MasterRunner): # Only run on worker nodes or local
-        return
-    print(f"Test started. TEST_ID: {TEST_ID}. Environment: {environment.host}")
-    print("InfluxDB: Conceptual - Initialize connection here if needed.")
-    print("InfluxDB: Conceptual - Store initial test metadata (e.g., test configuration).")
-    # Example:
-    # influx_client.write_point(measurement="test_runs",
-    #                           tags={"test_id": TEST_ID, "status": "started"},
-    #                           fields={"target_url_logging": FULL_TARGET_URL_FOR_LOGGING, "endpoint_path": ENDPOINT_PATH, "request_method": REQUEST_METHOD, "user_count": environment.runner.target_user_count},
-    #                           time=datetime.utcnow())
-
-@events.test_stop.add_listener
-def on_test_stop(environment, **kwargs):
-    # This event is triggered when a test is stopped.
-    # For distributed runs, this runs on the master node.
-    if not isinstance(environment.runner, MasterRunner): # Only run on worker nodes or local
-        return
-    print(f"Test stopped. TEST_ID: {TEST_ID}")
-    print("InfluxDB: Conceptual - Finalize test run data.")
-    print("InfluxDB: Conceptual - Write summary statistics to InfluxDB.")
-    # Example:
-    # stats = environment.runner.stats.total
-    # influx_client.write_point(measurement="test_runs",
-    #                           tags={"test_id": TEST_ID, "status": "finished"},
-    #                           fields={"total_requests": stats.num_requests, "total_failures": stats.num_failures, "avg_rps": stats.total_rps},
-    #                           time=datetime.utcnow())
-
-@events.request.add_listener
-def on_request(request_type, name, response_time, response_length, exception, context, **kwargs):
-    # This event is triggered for every request made by Locust.
-    # It's a good place to push detailed metrics to InfluxDB.
-    # This runs on each worker node in a distributed setup.
-    # To avoid overwhelming InfluxDB, consider batching points or sampling.
-
-    # Conceptual InfluxDB Line Protocol:
-    # measurement_name,tag_key1=tag_value1,tag_key2=tag_value2 field_key1=field_value1,field_key2=field_value2 timestamp
-
-    # Example structure:
-    # measurement = "locust_requests"
-    # tags = {
-    #     "test_id": TEST_ID,
-    #     "request_name": name,
-    #     "request_type": request_type, # e.g., GET, POST
-    #     "status": "success" if exception is None else "failure",
-    #     # "worker_id": environment.runner.client_id # If running distributed
-    # }
-    # fields = {
-    #     "response_time": response_time, # ms
-    #     "response_length": response_length, # bytes
-    #     "exception": str(exception) if exception else None,
-    #     # "user_count_at_request": environment.runner.user_count # Current user count
-    # }
-    # timestamp_ns = time.time_ns() # InfluxDB expects nanoseconds
-
-    # print(f"InfluxDB: Conceptual - Write point: {measurement},{tags} {fields} {timestamp_ns}")
-    # Actual implementation would involve an InfluxDB client and batching.
-    pass # Placeholder for actual InfluxDB write logic
-
-# --- Placeholder for other stats (could be in a separate module) ---
-# Accessing Locust's runner stats:
-# environment.runner.stats.total.num_requests
-# environment.runner.stats.total.num_failures
-# environment.runner.stats.total.avg_response_time
-# environment.runner.stats.total.requests_per_sec
-# environment.runner.stats.total.get_percentile("0.95") # 95th percentile response time
-
-# Metrics to collect for InfluxDB:
-# - Per request: response time, success/failure, request name, type, content length
-# - Aggregated: RPS, failure rate, average/median/percentile response times, user count
-# - System: CPU/memory of Locust workers (requires psutil, might be out of scope for this script)
-
-if __name__ == "__main__":
-    # This allows running the Locust file directly for local testing, e.g.:
-    # locust -f backend/locust_scripts/locust_generic_test.py --host=http://localhost:5000
-    # Environment variables would need to be set in the shell, e.g.:
-    # export TARGET_URL="http://localhost:5000" # This would be used by --host or User.host
-    # export ENDPOINT_PATH="/perf-service/api/quickTestStart"
-    # export REQUEST_METHOD="POST"
-    # export HEADERS='{"Content-Type":"multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"}' # Example, adjust as needed
-    # export PAYLOAD='{"script": "@path/to/your/script.py", "config": "{}"}' # This needs careful handling for file uploads
-    print("Locust file can be run with 'locust -f backend/locust_scripts/locust_generic_test.py'")
-    print("Ensure ENDPOINT_PATH, REQUEST_METHOD etc. are set as environment variables and use --host for the base URL.")
-    # For POST requests with multipart/form-data, the payload construction is more complex
-    # and typically handled by Locust's self.client.post with the `files` parameter,
-    # which is not directly settable via a simple JSON PAYLOAD env var.
-    # This generic script might need adaptation for complex POSTs if run directly.
-    # The Flask app will be responsible for constructing the correct Locust command and env vars.
-    pass
+    def _prepare_payload(self, body_str):
+        if self.payload_type == "json":
+            try:
+                return {"json": json.loads(body_str)}, None
+            except json.JSONDecodeError:
+                logger.warning(f"Payload type is 'json' but body is not valid JSON. Sending as raw data with Content-Type application/json. Body: {body_str[:100]}")
+                return {"data": body_str}, "application/json"
+        elif self.payload_type == "form":
+            # body_str is now expected to be a pre-urlencoded string,
+            # possibly with template values substituted (e.g., "key=value&name=actual_username").
+            # This string will be passed directly as the request body.
+            # FastHttpUser with `Content-Type: application/x-www-form-urlencoded`
+            # should handle this pre-urlencoded string correctly.
+            logger.info(f"Using pre-urlencoded string for form payload: {body_str[:200]}")
+            return {"data": body_str}, "application/x-www-form-urlencoded"
+        elif self.payload_type == "text":
+            return {"data": body_str}, "text/plain"
+        elif self.payload_type == "binary":
+            binary_file_path = os.getenv("PAYLOAD_TEMPLATE")
+            if binary_file_path and os.path.exists(binary_file_path):
+                try:
+                    with open(binary_file_path, "rb") as f:
+                        binary_data = f.read()
+                    return {"data": binary_data}, "application/octet-stream"
+                except Exception as e:
+                    logger.error(f"Error reading binary file specified in PAYLOAD_TEMPLATE ('{binary_file_path}'): {e}")
+                    return {"data": b""}, "application/octet-stream"
+            else:
+                logger.warning(f"PAYLOAD_TYPE is 'binary' but PAYLOAD_TEMPLATE ('{binary_file_path}') not found or not set. Sending empty binary data.")
+                return {"data": b""}, "application/octet-stream"
+        else:
+            logger.warning(f"Unknown payload type '{self.payload_type}'. Sending as raw data with no explicit Content-Type.")
+            return {"data": body_str}, None
