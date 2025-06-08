@@ -4,10 +4,11 @@ from locust.runners import MasterRunner # Required for test_start/test_stop on m
 
 # --- Configuration from Environment Variables (Placeholders) ---
 # These will be read from environment variables passed by the Flask app
-TARGET_URL = os.getenv("TARGET_URL", "http://localhost:8080/default_path") # Default for local testing
+FULL_TARGET_URL_FOR_LOGGING = os.getenv("TARGET_URL", "http://localhost:8080/default_path") # Default for local testing
+ENDPOINT_PATH = os.getenv("ENDPOINT_PATH", "/default_path") # Actual path for requests
 REQUEST_METHOD = os.getenv("REQUEST_METHOD", "GET")
-HEADERS_STR = os.getenv("HEADERS", "{}") # e.g., '{"Content-Type":"application/json", "X-API-Key":"secret"}'
-PAYLOAD_STR = os.getenv("PAYLOAD", "{}") # e.g., '{"key":"value"}'
+HEADERS_STR = os.getenv("HEADERS_STR", "{}") # e.g., '{"Content-Type":"application/json", "X-API-Key":"secret"}'
+PAYLOAD_STR = os.getenv("PAYLOAD_STR", "{}") # e.g., '{"key":"value"}'
 THINK_TIME_MIN_STR = os.getenv("THINK_TIME_MIN", "1") # Min wait time between tasks in seconds
 THINK_TIME_MAX_STR = os.getenv("THINK_TIME_MAX", "1") # Max wait time between tasks in seconds
 TEST_ID = os.getenv("TEST_ID", "default_test_run") # Unique ID for the test run
@@ -18,12 +19,12 @@ TARGET_QPS_STR = os.getenv("TARGET_QPS", "10") # Target QPS for constant_qps mod
 try:
     import json
     HEADERS = json.loads(HEADERS_STR)
-    PAYLOAD = json.loads(PAYLOAD_STR) if PAYLOAD_STR else None
+    PAYLOAD = json.loads(PAYLOAD_STR) if PAYLOAD_STR else None # Original logic: if PAYLOAD_STR is "{}" -> PAYLOAD = {}
     THINK_TIME_MIN = float(THINK_TIME_MIN_STR)
     THINK_TIME_MAX = float(THINK_TIME_MAX_STR)
     TARGET_QPS = int(TARGET_QPS_STR)
 except json.JSONDecodeError as e:
-    print(f"Error parsing JSON from environment variables: {e}")
+    print(f"Error parsing JSON from environment variables: {e}") # Keep standard error print
     HEADERS = {}
     PAYLOAD = None
     THINK_TIME_MIN = 1.0
@@ -62,7 +63,8 @@ else:
 
 
 class GenericUser(*base_classes):
-    host = os.getenv("TARGET_URL", "http://localhost:8080")
+    # host attribute is inherited from HttpUser or set via --host CLI argument.
+    # The old hardcoded host line has been removed.
     # wait_time is used by Locust's scheduler if no QPS plugin is active or if the plugin doesn't manage all tasks.
     # If ConstantQPSUserMixin is active, its internal timer dictates task execution frequency.
     # The mixin sets its own wait_time to None.
@@ -86,9 +88,11 @@ class GenericUser(*base_classes):
         super().on_start() # Important for mixins like ConstantQPSUserMixin
 
         print(f"GenericUser instance started. User ID: {self._user_id_for_logging()}")
-        print(f"  TARGET_URL: {TARGET_URL}, METHOD: {REQUEST_METHOD}")
+        print(f"  (Host will be: {self.host} from --host CLI or User.host attribute)")
+        print(f"  ENDPOINT_PATH: {ENDPOINT_PATH}, METHOD: {REQUEST_METHOD}")
         if PAYLOAD:
             print(f"  Payload: {PAYLOAD}")
+        print(f"  (Full example URL for logging was: {FULL_TARGET_URL_FOR_LOGGING})")
 
         if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
             print(f"  Mode: Constant QPS (Target: {TARGET_QPS} QPS per user)")
@@ -117,19 +121,20 @@ class GenericUser(*base_classes):
         Helper method to make the actual HTTP request based on configuration.
         Used by both QPS mode (via execute_main_task_for_qps) and generic @task.
         """
-        request_name = f"{REQUEST_METHOD}_{TARGET_URL}"
+        request_name = f"{REQUEST_METHOD}_{ENDPOINT_PATH}" # Name uses the specific endpoint path
         if LOCUST_MODE == "constant_qps" and ConstantQPSUserMixin:
             request_name += "_QPS"
 
+        # self.client.get/post etc. will use self.host (from CLI or User.host) + ENDPOINT_PATH
         if REQUEST_METHOD.upper() == "GET":
-            self.client.get(TARGET_URL, headers=HEADERS, name=request_name)
+            self.client.get(ENDPOINT_PATH, headers=HEADERS, name=request_name)
         elif REQUEST_METHOD.upper() == "POST":
             # For file uploads (multipart/form-data), PAYLOAD needs special handling.
             # The current simple PAYLOAD_STR is for JSON.
             # Actual file uploads would require self.client.post with 'files' parameter.
             # This needs to be addressed when handling file uploads from Flask.
             # For now, assuming JSON payload if POST.
-            self.client.post(TARGET_URL, headers=HEADERS, json=PAYLOAD, name=request_name)
+            self.client.post(ENDPOINT_PATH, headers=HEADERS, json=PAYLOAD, name=request_name)
         # Add other methods (PUT, DELETE, etc.) as needed
         else:
             print(f"User {self._user_id_for_logging()}: Unsupported HTTP method: {REQUEST_METHOD}")
@@ -184,7 +189,7 @@ def on_test_start(environment, **kwargs):
     # Example:
     # influx_client.write_point(measurement="test_runs",
     #                           tags={"test_id": TEST_ID, "status": "started"},
-    #                           fields={"target_url": TARGET_URL, "request_method": REQUEST_METHOD, "user_count": environment.runner.target_user_count},
+    #                           fields={"target_url_logging": FULL_TARGET_URL_FOR_LOGGING, "endpoint_path": ENDPOINT_PATH, "request_method": REQUEST_METHOD, "user_count": environment.runner.target_user_count},
     #                           time=datetime.utcnow())
 
 @events.test_stop.add_listener
@@ -251,12 +256,13 @@ if __name__ == "__main__":
     # This allows running the Locust file directly for local testing, e.g.:
     # locust -f backend/locust_scripts/locust_generic_test.py --host=http://localhost:5000
     # Environment variables would need to be set in the shell, e.g.:
-    # export TARGET_URL="http://localhost:5000/perf-service/api/quickTestStart"
+    # export TARGET_URL="http://localhost:5000" # This would be used by --host or User.host
+    # export ENDPOINT_PATH="/perf-service/api/quickTestStart"
     # export REQUEST_METHOD="POST"
     # export HEADERS='{"Content-Type":"multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"}' # Example, adjust as needed
     # export PAYLOAD='{"script": "@path/to/your/script.py", "config": "{}"}' # This needs careful handling for file uploads
     print("Locust file can be run with 'locust -f backend/locust_scripts/locust_generic_test.py'")
-    print("Ensure TARGET_URL, REQUEST_METHOD etc. are set as environment variables or via --host.")
+    print("Ensure ENDPOINT_PATH, REQUEST_METHOD etc. are set as environment variables and use --host for the base URL.")
     # For POST requests with multipart/form-data, the payload construction is more complex
     # and typically handled by Locust's self.client.post with the `files` parameter,
     # which is not directly settable via a simple JSON PAYLOAD env var.
