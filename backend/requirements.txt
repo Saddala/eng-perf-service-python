@@ -1,0 +1,5 @@
+Flask
+locust
+jsonpath-ng
+zstandard
+python-dotenv

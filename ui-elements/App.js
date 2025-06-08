@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import LiveResultsPage from './LiveResultsPage'; // Import LiveResultsPage
 import {
     Tabs,
     Tab,
@@ -34,7 +35,7 @@ const tabFieldMap = {
 const methodOptions = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 const payloadTypeOptions = ["json", "form", "text", "binary", "protobuf"]; // Added protobuf
 
-const TestTab = ({ type }) => {
+const TestTab = ({ type, onTestStart }) => { // Added onTestStart prop
     // Separate states for different types of form data
     const [requestParams, setRequestParams] = useState({
         method: "GET", url: "", host: "", auth_token: "", headers: "", query_params: ""
@@ -124,14 +125,42 @@ const TestTab = ({ type }) => {
         if (dataFile) formData.append("dataFile", dataFile); // This matches @RequestParam(value = "dataFile")
         if (payloadTemplateFile) formData.append("payloadTemplateFile", payloadTemplateFile); // Matches @RequestParam(value = "payloadTemplateFile")
 
+        // Constructing the new endpoint based on test type
+        const typeToPathSegment = {
+            "Ramp-Up Test": "ramp-up",
+            "QPS Test": "qps",
+            "Spike Test": "spike",
+            "Soak Test": "soak",
+            "Stress Test": "stress",
+            "Data-Driven Test": "data-driven"
+        };
+        const apiPathSegment = typeToPathSegment[type] || "generic"; // Default to "generic" if type not found
+        const endpoint = `/perf-service/api/${apiPathSegment}/start`;
+
+        console.log("Selected test type:", type);
+        console.log("Target API path segment:", apiPathSegment);
+        console.log("Submitting to endpoint:", endpoint);
+        // Log form data for debugging
+        // for (let [key, value] of formData.entries()) {
+        //     console.log(key, value);
+        // }
+
         try {
-            const res = await fetch("/perf-service/api/quickTestStart", {
+            const res = await fetch(endpoint, { // Use the dynamically constructed endpoint
                 method: "POST",
                 body: formData,
             });
 
             const data = await res.json(); // Expect JSON response from backend
             setResponseSummary(JSON.stringify(data, null, 2)); // Pretty print JSON
+
+            if (res.ok && data.test_id) {
+                // console.log("Test started with ID:", data.test_id, "Would navigate to /results/", data.test_id);
+                if (onTestStart) {
+                    onTestStart(data.test_id); // Call the callback to switch view
+                }
+            }
+
 
             // Store history for recently run tests
             const record = {
@@ -356,7 +385,8 @@ const TestTab = ({ type }) => {
     );
 };
 
-export default function PerformanceTestTabs() {
+// Renamed original export to PerformanceTestConfigPage for clarity
+function PerformanceTestConfigPage({ onTestStart }) { // Added onTestStart prop
     const [activeTab, setActiveTab] = useState(0);
 
     return (
@@ -375,7 +405,30 @@ export default function PerformanceTestTabs() {
                     <Tab key={idx} label={label} />
                 ))}
             </Tabs>
-            <TestTab type={tabTypes[activeTab]} />
+            {/* Pass onTestStart to TestTab */}
+            <TestTab type={tabTypes[activeTab]} onTestStart={onTestStart} />
         </Box>
     );
+}
+
+// New main App component to handle view switching
+export default function App() {
+    const [currentView, setCurrentView] = useState("config"); // "config" or "results"
+    const [activeTestId, setActiveTestId] = useState(null);
+
+    const handleTestStart = (testId) => {
+        setActiveTestId(testId);
+        setCurrentView("results");
+    };
+
+    const handleBackToConfig = () => {
+        setCurrentView("config");
+        setActiveTestId(null);
+    };
+
+    if (currentView === "results" && activeTestId) {
+        return <LiveResultsPage test_id={activeTestId} onBackToConfig={handleBackToConfig} />;
+    }
+
+    return <PerformanceTestConfigPage onTestStart={handleTestStart} />;
 }
