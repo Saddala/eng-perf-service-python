@@ -25,6 +25,10 @@ def _start_test_run(test_type_from_url="generic"):
         test_run_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
         os.makedirs(test_run_dir, exist_ok=True)
 
+        app.logger.info(f"[{test_id}][{test_type_from_url}] Current working directory: {os.getcwd()}")
+        app.logger.info(f"[{test_id}][{test_type_from_url}] BASE_TEST_RESULTS_DIR: {BASE_TEST_RESULTS_DIR}")
+        app.logger.info(f"[{test_id}][{test_type_from_url}] test_run_dir created (or confirmed exists): {test_run_dir}")
+
         app.logger.info(f"[{test_id}][{test_type_from_url}] New test run initiated. Directory: {test_run_dir}")
         app.logger.info(f"[{test_id}][{test_type_from_url}] Received form data: {request.form}")
         app.logger.info(f"[{test_id}][{test_type_from_url}] Received files: {request.files}")
@@ -215,8 +219,14 @@ if __name__ == '__main__':
 @app.route('/perf-service/api/results/<string:test_id>/live', methods=['GET'])
 def get_live_results(test_id):
     try:
+        app.logger.info(f"[{test_id}] get_live_results: Current working directory: {os.getcwd()}")
+        app.logger.info(f"[{test_id}] get_live_results: BASE_TEST_RESULTS_DIR: {BASE_TEST_RESULTS_DIR}")
         test_run_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
-        if not os.path.isdir(test_run_dir):
+        app.logger.info(f"[{test_id}] get_live_results: Attempting to access test_run_dir: {test_run_dir}")
+
+        dir_exists = os.path.isdir(test_run_dir)
+        app.logger.info(f"[{test_id}] get_live_results: os.path.isdir({test_run_dir}) check result: {dir_exists}")
+        if not dir_exists:
             return jsonify({"error": "Test ID not found or results directory does not exist.", "test_id": test_id}), 404
 
         # Locust with --json and --headless prints JSON stats to stdout,
