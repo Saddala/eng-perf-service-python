@@ -1,17 +1,10 @@
-from flask import current_app
-from locust import task, events, between
+from locust import task, events, between # Import 'between' directly from locust
 from locust.contrib.fasthttp import FastHttpUser
 import os, csv, json, sys
 from string import Template
 from urllib.parse import urlencode
 from jsonpath_ng import jsonpath, parse
 import logging
-import time
-from locust import events
-
-from backend.app import BASE_TEST_RESULTS_DIR
-from locust_logger import get_logger
-from gevent import sleep, spawn
 
 # Get the absolute path of the directory containing this script.
 # This ensures it works regardless of the current working directory from which Locust is started.
@@ -34,41 +27,10 @@ DEFAULT_WAIT_TIME_MIN = 1
 DEFAULT_WAIT_TIME_MAX = 2
 GLOBAL_TARGET_QPS = float(os.getenv("TARGET_QPS", 0)) # Define GLOBAL_TARGET_QPS here
 
-locust_log = get_logger()
-
-@events.request.add_listener
-def log_request(request_type, name, response_time, response_length, response, context, exception, **kwargs):
-    locust_log.log_event("request", {
-        "request_type": request_type,
-        "name": name,
-        "response_time": response_time,
-        "response_length": response_length,
-        "success": exception is None
-    })
-
-@events.test_start.add_listener
-def on_test_start(environment, **kwargs):
-    def periodic_summary_logger():
-        while True:
-            try:
-                stats = environment.stats.total
-                locust_log.log_event("summary", {
-                    "user_count": environment.runner.user_count,
-                    "rps": stats.total_rps,
-                    "fail_ratio": stats.fail_ratio,
-                    "p95": stats.get_response_time_percentile(0.95),
-                    "p99": stats.get_response_time_percentile(0.99),
-                })
-                sleep(5)
-            except Exception as e:
-                locust_log.log_event("error", {"message": f"Failed to emit summary stats: {e}"})
-                break
-
-    spawn(periodic_summary_logger)
-
 # --- Custom Event for JSONPath Metrics ---
 @events.init.add_listener
-def _locust_init_handler(environment, **kwargs):
+def _locust_init_handler(environment, **kwargs): # Renamed _ to a more descriptive name for clarity
+    # Ensure environment.tags is a list (Locust typically ensures this, but good to be safe)
     if not hasattr(environment, 'tags'):
         environment.tags = []
 
@@ -105,6 +67,19 @@ class GenericUser(FastHttpUser):
         self._load_test_config() # Load config first as it might be needed for wait_time setup
         self._configure_wait_time()
 
+
+#     def _configure_wait_time(self):
+#         if GLOBAL_TARGET_QPS > 0:
+#             # If target QPS is set, use ConstantThroughput
+#             # Pass GLOBAL_TARGET_QPS and self.environment directly
+#             self.wait_time = ConstantThroughput(GLOBAL_TARGET_QPS, self.environment)
+#             # Log initial calculated per-user rate, but remind it's dynamic
+#             logger.info(f"Using ConstantThroughput with GLOBAL_TARGET_QPS: {GLOBAL_TARGET_QPS}. Per-user rate will dynamically adjust.")
+#             logger.warning("WAIT_TIME_MIN and WAIT_TIME_MAX environment variables will be ignored when TARGET_QPS is set.")
+#         else:
+#             # Otherwise, use the configured wait_time_min/max
+#             self.wait_time = between(self.wait_time_min, self.wait_time_max)
+#             logger.info(f"Using standard wait time: between({self.wait_time_min}, {self.wait_time_max}) seconds.")
 
     @classmethod
     def _configure_wait_time(cls):
@@ -150,8 +125,7 @@ class GenericUser(FastHttpUser):
             logger.warning("DATA_FILE environment variable not set. No data will be used for requests.")
         elif not os.path.exists(data_file):
             logger.error(f"DATA_FILE '{data_file}' not found. Please check the path.")
-            if self.environment and self.environment.runner: # Check if runner exists
-                self.environment.runner.quit()
+            self.environment.runner.quit()
         else:
             try:
                 if data_file.endswith(".csv"):
@@ -164,12 +138,10 @@ class GenericUser(FastHttpUser):
                     logger.info(f"Loaded {len(self.data_rows)} entries from JSON: {data_file}")
                 else:
                     logger.error(f"Unsupported data file type: {data_file}. Only .csv and .json are supported.")
-                    if self.environment and self.environment.runner: # Check if runner exists
-                        self.environment.runner.quit()
+                    self.environment.runner.quit()
             except Exception as e:
                 logger.error(f"Error loading data file '{data_file}': {e}")
-                if self.environment and self.environment.runner: # Check if runner exists
-                    self.environment.runner.quit()
+                self.environment.runner.quit()
 
         # --- Error Handling for Payload Template ---
         if not payload_template_path:
@@ -177,8 +149,7 @@ class GenericUser(FastHttpUser):
             self.payload_template = Template("") # Empty template
         elif not os.path.exists(payload_template_path):
             logger.error(f"PAYLOAD_TEMPLATE '{payload_template_path}' not found. Please check the path.")
-            if self.environment and self.environment.runner: # Check if runner exists
-                self.environment.runner.quit()
+            self.environment.runner.quit()
         else:
             try:
                 with open(payload_template_path) as f:
@@ -186,8 +157,7 @@ class GenericUser(FastHttpUser):
                 logger.info(f"Loaded payload template from: {payload_template_path}")
             except Exception as e:
                 logger.error(f"Error loading payload template '{payload_template_path}': {e}")
-                if self.environment and self.environment.runner: # Check if runner exists
-                    self.environment.runner.quit()
+                self.environment.runner.quit()
 
         # --- Load JSONPath Assertions ---
         expected_json_path_value_str = os.getenv("EXPECTED_JSON_PATH_VALUE")
@@ -214,6 +184,7 @@ class GenericUser(FastHttpUser):
             except Exception as e:
                 logger.error(f"Error processing CUSTOM_METRICS_JSON_PATH: {e}")
 
+
     @task
     def execute_request(self):
         current_data_row = {}
@@ -225,59 +196,51 @@ class GenericUser(FastHttpUser):
             except IndexError:
                 logger.warning("Data rows exhausted. If REUSE_DATA is 'false', tasks may idle.")
                 return
-        elif not self.data_rows and (
-                self.payload_template and "${" in self.payload_template.template):  # Check if template exists before accessing .template
-            logger.warning(
-                "No data rows loaded, but payload template appears to expect variables. Request might fail or send incomplete data.")
+        elif not self.data_rows and (self.payload_template and "${" in self.payload_template.template):
+            logger.warning("No data rows loaded, but payload template appears to expect variables. Request might fail or send incomplete data.")
 
-        # Ensure payload_template is not None before calling safe_substitute
-        body_str = self.payload_template.safe_substitute(current_data_row) if self.payload_template else ""
-
+        body_str = self.payload_template.safe_substitute(current_data_row)
         payload, content_type = self._prepare_payload(body_str)
 
         full_headers = self.headers.copy()
-        if content_type:  # Ensure content_type is not None before assigning
+        if content_type:
             full_headers["Content-Type"] = content_type
 
-        req_method_name = self.method.lower()
-        if not hasattr(self.client, req_method_name):
-            logger.error(f"Unsupported HTTP method '{self.method}' for FastHttpUser client.")
-            return
-        req_method = getattr(self.client, req_method_name)
-
+        req_method = getattr(self.client, self.method.lower())
         req_args = {
             "headers": full_headers,
-            "name": self.endpoint,  # Use endpoint as the default name for grouping in Locust stats
-            "catch_response": True,  # FastHttpUser uses catch_response
+            "catch_response": True,
         }
-        if payload:  # Ensure payload is not None or empty before updating
+        if payload:
             req_args.update(payload)
 
-        # For FastHttpUser, the path is the first argument.
-        # self.endpoint should be like "/api/users"
-        effective_endpoint = self.endpoint if self.endpoint.startswith("/") else "/" + self.endpoint
+        print("::::::::::::::CCCCCCCC::::::::::::::")
+        print(payload)
+        print("req_args before sending:", req_args)
 
-        with req_method(effective_endpoint, **req_args) as response:
+        with req_method(self.endpoint, **req_args) as response:
+            print("response.status_code::::::::::::::::::::::", response.status_code)
+            print(f"Response Body (raw bytes): {response.headers.get('Content-Length')}")
             if 200 <= response.status_code < 300:
-                resp_content_type = response.headers.get("Content-Type", "").lower()
+                content_type = response.headers.get("Content-Type", "").lower()
 
-                if "application/json" in resp_content_type:
+                if "application/json" in content_type:
                     self._handle_json_response(response)
-                elif "text/" in resp_content_type or "application/xml" in resp_content_type:
-                    self._handle_text_response(response, resp_content_type)
-                elif "image/" in resp_content_type or "application/octet-stream" in resp_content_type or "application/pdf" in resp_content_type:
-                    self._handle_binary_response(response, resp_content_type)
-                elif response.status_code == 204:  # No Content
+                elif "text/" in content_type or "application/xml" in content_type:
+                    self._handle_text_response(response, content_type)
+                elif "image/" in content_type or "application/octet-stream" in content_type or "application/pdf" in content_type:
+                    self._handle_binary_response(response, content_type)
+                elif response.status_code == 204: # No Content
                     self._handle_no_content_response(response)
                 else:
-                    self._handle_unknown_content_type(response, resp_content_type)
+                    # Fallback for unknown content types
+                    self._handle_unknown_content_type(response, content_type)
             else:
                 response.failure(f"❌ HTTP {response.status_code} - {response.text}")
-                logger.error(
-                    f"Request failed: {self.method} {effective_endpoint} - {response.status_code} - {response.text[:200]}")
-
+                logger.error(f"Request failed: {self.method} {self.endpoint} - {response.status_code} - {response.text[:200]}")
 
     def _handle_json_response(self, response):
+        """Handles successful HTTP responses, including custom assertions and metrics."""
         is_success = True
         failure_message = []
         response_json = {}
@@ -292,15 +255,18 @@ class GenericUser(FastHttpUser):
             is_success = False
             failure_message.append(f"Error parsing response JSON: {e}")
 
-        if is_success and self.expected_json_path_values and response_json:
+        # --- Custom JSONPath Assertions ---
+        if is_success and self.expected_json_path_values:
             for json_path_str, expected_value in self.expected_json_path_values.items():
                 try:
                     jsonpath_expr = parse(json_path_str)
                     matches = jsonpath_expr.find(response_json)
+
                     if not matches:
                         is_success = False
                         failure_message.append(f"JSONPath '{json_path_str}' found no matches.")
                         break
+
                     actual_value = matches[0].value
                     if actual_value != expected_value:
                         is_success = False
@@ -311,6 +277,7 @@ class GenericUser(FastHttpUser):
                     failure_message.append(f"Error evaluating JSONPath '{json_path_str}': {e}")
                     break
 
+        # --- Custom Metrics from JSONPath ---
         if is_success and self.custom_metrics_json_paths and response_json:
             for json_path_str in self.custom_metrics_json_paths:
                 try:
@@ -318,15 +285,18 @@ class GenericUser(FastHttpUser):
                     matches = jsonpath_expr.find(response_json)
                     for match in matches:
                         metric_name = f"jsonpath.{json_path_str.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '').strip('_')}"
-                        ctx = self.environment.context if self.environment and hasattr(self.environment, 'context') else {}
+
+                        # Corrected: Pass match.value to response_time (if numeric) for plotting
+                        # and pass the original 'response' object as the response.
                         events.request.fire(
                             request_type="JSONPath_Metric",
                             name=metric_name,
-                            response_time=match.value if isinstance(match.value, (int, float)) else 0,
+                            response_time=match.value if isinstance(match.value, (int, float)) else 0, # Metric value as response_time
                             response_length=0,
                             exception=None,
-                            context=ctx,
-                            response=response
+                            context=self.environment.context,
+                            url=self.endpoint,
+                            response=response # Pass the actual HTTP response object
                         )
                         logger.debug(f"Reported custom metric '{metric_name}': {match.value}")
                 except Exception as e:
@@ -335,69 +305,88 @@ class GenericUser(FastHttpUser):
         if is_success:
             response.success()
         else:
-            failure_str = f"❌ JSON Assertion Failed: {' '.join(failure_message)}" if failure_message else "❌ Processing Failed"
-            response.failure(failure_str)
-
+            response.failure(f"❌ JSON Assertion Failed: {' '.join(failure_message)}")
     def _handle_text_response(self, response, content_type):
+        """Handles responses with Content-Type: text/* or application/xml"""
         try:
             text_content = response.text
-            if text_content:
-                response.success()
-                logger.info(f"{content_type}: Text response received (length: {len(text_content)})")
+            # Perform assertions on text content (e.g., search for keywords)
+            if "Welcome to our page" in text_content or "Success" in text_content:
+                response.success(f"{content_type}: Expected text found")
             else:
-                response.failure(f"{content_type}: Empty text response.")
+                response.failure(f"{content_type}: Expected text not found. Body: {text_content[:200]}...")
         except Exception as e:
             response.failure(f"{content_type}: Error processing text: {e} - Body: {response.text[:200]}...")
 
     def _handle_binary_response(self, response, content_type):
-        binary_content = response.content
+        """Handles responses with Content-Type: image/*, application/octet-stream, etc."""
+        binary_content = response.content # Use .content for raw bytes
         if len(binary_content) > 0:
+            # You might check file size, or perform a simple checksum/magic number check
+            # For complex validation of binary files, you might save and then process
+            # For performance testing, often just verifying length/existence is enough.
             logger.info(f"{content_type}: Binary data received (length: {len(binary_content)} bytes)")
             response.success()
+            # Example: If it's an image, you might try to use PIL/Pillow to verify
+            # from PIL import Image
+            # try:
+            #     img = Image.open(io.BytesIO(binary_content))
+            #     if img.width > 0 and img.height > 0:
+            #         response.success(f"{content_type}: Image received ({img.width}x{img.height})")
+            #     else:
+            #         response.failure(f"{content_type}: Invalid image dimensions")
+            # except Exception as img_e:
+            #     response.failure(f"{content_type}: Failed to parse image: {img_e}")
         else:
             response.failure(f"{content_type}: Empty binary response")
 
     def _handle_no_content_response(self, response):
-        if not response.content:
+        """Handles 204 No Content responses"""
+        if not response.content: # Ensure there's no body
             logger.info("204 No Content: As expected")
             response.success()
         else:
             response.failure(f"204 No Content: Unexpected body present. Length: {len(response.content)}")
 
     def _handle_unknown_content_type(self, response, content_type):
-        logger.warning(f"Unknown Content-Type ({content_type}) received for {self.method} {self.endpoint}. Status: {response.status_code}. Body: {response.text[:200]}...")
-        response.success()
+        """Handles content types not explicitly covered"""
+        response.failure(f"Unknown Content-Type ({content_type}) - Status: {response.status_code} - Body: {response.text[:200]}...")
+
+    def _handle_error_response(self, response):
+        """Handles non-2xx status codes (e.g., 4xx, 5xx)"""
+        # You can define specific failure messages based on status code
+        if response.status_code == 404:
+            response.failure(f"Error 404: Not Found")
+        elif response.status_code == 500:
+            response.failure(f"Error 500: Internal Server Error - {response.text[:200]}...")
+        else:
+            response.failure(f"Unexpected status code: {response.status_code} - Body: {response.text[:200]}...")
+
 
     def _prepare_payload(self, body_str):
+        """
+        Returns tuple (payload_dict, content_type) for the FastHttpUser client.
+        """
         if self.payload_type == "json":
             try:
-                return {"json": json.loads(body_str)}, None
+                return {"json": json.loads(body_str)}, "application/json"
             except json.JSONDecodeError:
-                logger.warning(f"Payload type is 'json' but body is not valid JSON. Sending as raw data with Content-Type application/json. Body: {body_str[:100]}")
+                logger.warning(f"Payload type is 'json' but body is not valid JSON. Sending as raw data. Body: {body_str[:100]}")
                 return {"data": body_str}, "application/json"
         elif self.payload_type == "form":
-            # body_str is now expected to be a pre-urlencoded string,
-            # possibly with template values substituted (e.g., "key=value&name=actual_username").
-            # This string will be passed directly as the request body.
-            # FastHttpUser with `Content-Type: application/x-www-form-urlencoded`
-            # should handle this pre-urlencoded string correctly.
-            logger.info(f"Using pre-urlencoded string for form payload: {body_str[:200]}")
-            return {"data": body_str}, "application/x-www-form-urlencoded"
+            try:
+                return {"data": urlencode(json.loads(body_str))}, "application/x-www-form-urlencoded"
+            except json.JSONDecodeError:
+                logger.warning(f"Payload type is 'form' but body is not valid JSON for form encoding. Sending as raw data. Body: {body_str[:100]}")
+                return {"data": body_str}, "application/x-www-form-urlencoded"
         elif self.payload_type == "text":
             return {"data": body_str}, "text/plain"
         elif self.payload_type == "binary":
             binary_file_path = os.getenv("PAYLOAD_TEMPLATE")
-            if binary_file_path and os.path.exists(binary_file_path):
-                try:
-                    with open(binary_file_path, "rb") as f:
-                        binary_data = f.read()
-                    return {"data": binary_data}, "application/octet-stream"
-                except Exception as e:
-                    logger.error(f"Error reading binary file specified in PAYLOAD_TEMPLATE ('{binary_file_path}'): {e}")
-                    return {"data": b""}, "application/octet-stream"
-            else:
-                logger.warning(f"PAYLOAD_TYPE is 'binary' but PAYLOAD_TEMPLATE ('{binary_file_path}') not found or not set. Sending empty binary data.")
-                return {"data": b""}, "application/octet-stream"
+            with open(binary_file_path, "rb") as f:
+                binary_data = f.read()
+            return {"data": binary_data}, "application/octet-stream"
+#             return {"data": body_str.encode("utf-8")}, "application/octet-stream"
         else:
             logger.warning(f"Unknown payload type '{self.payload_type}'. Sending as raw data with no explicit Content-Type.")
             return {"data": body_str}, None

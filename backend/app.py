@@ -1,17 +1,32 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, current_app, Response
+import time
 import os
 import subprocess
 import uuid
 import json
-import shutil # For operations like ensuring directory exists, or cleaning up
+import signal
+import psutil
+
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
+
+# origins = [
+#     "http://localhost:3001",
+#     "http://your-production-frontend-domain.com"
+# ]
+#
+# CORS(app, origins=origins, supports_credentials=True)
 
 # Ensure the base directory for test results exists
-BASE_TEST_RESULTS_DIR = os.path.join(os.getcwd(), "backend", "test_results")
+BASE_TEST_RESULTS_DIR = os.path.join(os.getcwd(), "test_results")
 os.makedirs(BASE_TEST_RESULTS_DIR, exist_ok=True)
 
-LOCUST_SCRIPT_PATH = os.path.join(os.getcwd(), "backend", "locust_scripts", "locust_generic_test.py")
+LOCUST_SCRIPT_PATH = os.path.join(os.getcwd(), "locust_scripts", "locust_generic_test.py")
+
+# if __name__ == '__main__':
+#     app.run(port=5001)
 
 # Basic route to check if the app is running
 @app.route('/')
@@ -142,6 +157,10 @@ def _start_test_run(test_type_from_url="generic"):
         with open(log_file_path, 'wb') as log_file:
             process = subprocess.Popen(cmd, env=locust_env, stdout=log_file, stderr=subprocess.STDOUT)
 
+        pid_file = os.path.join(test_run_dir, "locust.pid")
+        with open(pid_file, "w") as f:
+            f.write(str(process.pid))
+
         app.logger.info(f"[{test_id}][{test_type_from_url}] Locust process started with PID: {process.pid}. Output logged to {log_file_path}")
 
         response_data = {
@@ -149,8 +168,8 @@ def _start_test_run(test_type_from_url="generic"):
             "test_id": test_id,
             "results_dir": test_run_dir,
             "locust_log_file": os.path.join(test_run_dir, "locust.log"),
-            "html_report": os.path.join(test_run_dir, "report.html"),
-            "metrics_file": locust_env["INFLUX_LINE_PROTOCOL_FILE_PATH"]
+            "html_report": os.path.join(test_run_dir, "report.html")
+            # "metrics_file": locust_env["INFLUX_LINE_PROTOCOL_FILE_PATH"]
         }
         return jsonify(response_data), 200
 
@@ -204,117 +223,202 @@ def start_data_driven_test():
 def start_generic_test():
     return _start_test_run(test_type_from_url="generic")
 
+@app.route('/perf-service/api/results/live', methods=['GET'])
+def get_live_results2():
+    app.logger.error(f"[] Error reading or parsing log file ")
+    return jsonify("success"), 200
+
+@app.route('/perf-service/api/results/<string:test_id>/live', methods=['GET'])
+def get_live_results(test_id):
+    try:
+        if not BASE_TEST_RESULTS_DIR:
+            current_app.logger.error(f"[{test_id}] SSE: BASE_TEST_RESULTS_DIR is not configured in Flask app!")
+
+            def config_error_stream():
+                error_json = json.dumps(
+                    {"error": "Server configuration error: BASE_TEST_RESULTS_DIR not set.", "test_id": test_id,
+                     "sse_status": "error_server_config"})
+                yield f"event: error\ndata: {error_json}\n\n"
+
+            return Response(config_error_stream(), mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+
+        test_run_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
+        locust_runner_log_path = os.path.join(test_run_dir, "flask_locust_runner_metrics.log")
+
+        if not os.path.isdir(test_run_dir):
+            current_app.logger.error(f"[{test_id}] SSE: Test ID directory not found: {test_run_dir}")
+
+            def error_stream_dir_not_found():
+                error_json = json.dumps(
+                    {"error": "Test ID not found or results directory does not exist.", "test_id": test_id,
+                     "sse_status": "error_no_directory"})
+                yield f"event: error\ndata: {error_json}\n\n"
+
+            return Response(error_stream_dir_not_found(), mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+
+        initial_log_exists = os.path.exists(locust_runner_log_path)
+        if not initial_log_exists:
+            current_app.logger.warning(
+                f"[{test_id}] SSE: Log file not yet created: {locust_runner_log_path}. Test might be initializing.")
+
+        # Define the generator for the event stream
+        def event_stream():
+            # test_id = os.environ.get('test_id')
+            # test_run_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
+            # locust_runner_log_path = os.path.join(test_run_dir, "flask_locust_runner_metrics.log")
+            last_file_size = 0
+            # initial_log_exists = os.path.exists(locust_runner_log_path)
+            print("******** event_stream **************")
+
+            if not initial_log_exists:
+                init_msg = {"message": "Log file not yet created. Monitoring for test start.", "test_id": test_id,
+                            "status": "initializing"}
+                yield f"event: status\ndata: {json.dumps(init_msg)}\n\n"
+
+            try:
+                try:
+                    curr_logger = current_app.logger
+                except RuntimeError:
+                    curr_logger = None
+                if curr_logger:
+                    curr_logger.info(f"[{test_id}] SSE: Starting event stream for {locust_runner_log_path}")
+
+                file_missing_reported = not initial_log_exists
+
+                while True:
+                    if not os.path.exists(locust_runner_log_path):
+                        if not file_missing_reported:
+                            msg = {"message": "Log file not found. Continuing to monitor.", "test_id": test_id,
+                                   "status": "waiting_for_log"}
+                            yield f"event: status\ndata: {json.dumps(msg)}\n\n"
+                            file_missing_reported = True
+                        time.sleep(2)
+                        continue
+
+                    file_missing_reported = False
+                    current_file_size = os.path.getsize(locust_runner_log_path)
+
+                    if current_file_size == last_file_size:
+                        time.sleep(1)
+                        continue
+
+                    new_lines_buffer = []
+                    with open(locust_runner_log_path, 'r') as f:
+                        if current_file_size < last_file_size:
+                            f.seek(0)
+                        else:
+                            f.seek(last_file_size)
+                        for line in f:
+                            new_lines_buffer.append(line.strip())
+
+                    last_file_size = current_file_size
+
+                    for line_content in new_lines_buffer:
+                        if line_content.startswith('{') and line_content.endswith('}'):
+                            try:
+                                parsed_json = json.loads(line_content)
+                                if "event" in parsed_json:
+                                    event_type = parsed_json.get("event", "update")
+                                    yield f"event: {event_type}\ndata: {json.dumps(parsed_json)}\n\n"
+
+                                    current_state = parsed_json.get("state")
+                                    if current_state and current_state.lower() in ["stopped", "finished", "cleanup"]:
+                                        final_msg = json.dumps({
+                                            "message": f"Test {current_state}.",
+                                            "test_id": test_id,
+                                            "state": current_state
+                                        })
+                                        yield f"event: test_completed\ndata: {final_msg}\n\n"
+                                        return
+                            except json.JSONDecodeError:
+                                continue
+
+                    time.sleep(0.5)
+
+            except GeneratorExit:
+                try:
+                    curr_logger = current_app.logger
+                except RuntimeError:
+                    curr_logger = None
+                if curr_logger:
+                    curr_logger.info(f"[{test_id}] SSE: Stream closed by client for {locust_runner_log_path}")
+
+            except Exception as e:
+                try:
+                    curr_logger = current_app.logger
+                except RuntimeError:
+                    curr_logger = None
+                if curr_logger:
+                    curr_logger.error(f"[{test_id}] SSE: Error in event stream for {locust_runner_log_path}: {str(e)}",
+                                      exc_info=True)
+                error_json = json.dumps({"error": f"Server error in SSE stream: {str(e)}", "test_id": test_id,
+                                         "sse_status": "error_streaming"})
+                try:
+                    yield f"event: error\ndata: {error_json}\n\n"
+                except Exception:
+                    pass
+
+            finally:
+                try:
+                    curr_logger = current_app.logger
+                except RuntimeError:
+                    curr_logger = None
+                if curr_logger:
+                    curr_logger.info(f"[{test_id}] SSE: Ending event stream generator for {locust_runner_log_path}")
+
+        response = Response(event_stream(), mimetype='text/event-stream')
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['Connection'] = 'keep-alive'
+        response.headers['X-Accel-Buffering'] = 'no'
+        return response
+
+    except Exception as e:
+        current_app.logger.error(f"[{test_id}] SSE: Critical error during initial setup for live results: {str(e)}",
+                                 exc_info=True)
+
+        def critical_setup_error_stream():
+            error_json = json.dumps({"error": f"Critical server error during SSE setup: {str(e)}", "test_id": test_id,
+                                     "sse_status": "error_critical_setup"})
+            yield f"event: error\ndata: {error_json}\n\n"
+
+        return Response(critical_setup_error_stream(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+
+
+@app.route('/perf-service/api/test/<string:test_id>/stop', methods=['POST'])
+def stop_test(test_id):
+    try:
+        test_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
+        pid_file = os.path.join(test_dir, "locust.pid")
+
+        if not os.path.exists(pid_file):
+            return jsonify({"error": "PID file not found for test_id", "test_id": test_id}), 404
+
+        with open(pid_file, 'r') as f:
+            pid = int(f.read().strip())
+
+        if not psutil.pid_exists(pid):
+            return jsonify({"error": "Process not running", "test_id": test_id}), 410
+
+        proc = psutil.Process(pid)
+        proc.send_signal(signal.SIGINT)
+
+        return jsonify({"message": "Stop signal sent to Locust test.", "test_id": test_id}), 200
+
+    except Exception as e:
+        try:
+            logger = current_app.logger
+        except RuntimeError:
+            logger = None
+        if logger:
+            logger.error(f"Failed to stop test {test_id}: {e}", exc_info=True)
+        return jsonify({"error": str(e), "test_id": test_id}), 500
+
 
 if __name__ == '__main__':
     # For local development:
     # The default Flask port is 5000. Ensure this matches what frontend expects if any.
     # Debug mode should be False in production.
-    app.run(debug=True, host='0.0.0.0', port=5001) # Changed port to 5001 for clarity
-
-
-@app.route('/perf-service/api/results/<string:test_id>/live', methods=['GET'])
-def get_live_results(test_id):
-    try:
-        test_run_dir = os.path.join(BASE_TEST_RESULTS_DIR, test_id)
-        if not os.path.isdir(test_run_dir):
-            return jsonify({"error": "Test ID not found or results directory does not exist.", "test_id": test_id}), 404
-
-        # Locust with --json and --headless prints JSON stats to stdout,
-        # which we redirected to flask_locust_runner.log.
-        locust_runner_log_path = os.path.join(test_run_dir, "flask_locust_runner.log")
-
-        if not os.path.exists(locust_runner_log_path):
-            return jsonify({"message": "Log file not yet created. Test might be initializing.", "test_id": test_id}), 202 # Accepted, but not ready
-
-        last_stats_json = None
-        try:
-            with open(locust_runner_log_path, 'r') as f:
-                for line in reversed(list(f)): # Read lines in reverse
-                    line = line.strip()
-                    if line.startswith('{') and line.endswith('}'):
-                        try:
-                            # Validate if it's actual JSON, as other log messages might exist
-                            parsed_json = json.loads(line)
-                            # Check for a key that indicates it's a Locust stats summary
-                            if "current_rps" in parsed_json or "user_count" in parsed_json:
-                                last_stats_json = parsed_json
-                                break # Found the last complete JSON stats line
-                        except json.JSONDecodeError:
-                            continue # Not a valid JSON line, try the previous one
-        except Exception as e:
-            app.logger.error(f"[{test_id}] Error reading or parsing log file {locust_runner_log_path}: {e}")
-            return jsonify({"error": f"Error reading or processing log file: {str(e)}", "test_id": test_id}), 500
-
-        if last_stats_json:
-            # Structure of last_stats_json can vary slightly based on Locust version and test type.
-            # Common fields include: current_rps, current_fail_per_sec, user_count, stats_total, stats (list of dicts)
-            # We might need to adapt what we extract based on typical output.
-            # For example, the detailed stats per endpoint are often in a list under "stats"
-            # and overall stats might be in "stats_total". If --json is used, it's usually a flatter structure.
-
-            # Example extraction (adapt as needed based on actual Locust JSON output format):
-            relevant_stats = {
-                "test_id": test_id,
-                "user_count": last_stats_json.get("user_count"),
-                "current_rps": last_stats_json.get("current_rps"),
-                "current_fail_per_sec": last_stats_json.get("current_fail_per_sec"),
-                "total_requests": last_stats_json.get("stats_total", {}).get("num_requests") if "stats_total" in last_stats_json else last_stats_json.get("total_requests"),
-                "total_failures": last_stats_json.get("stats_total", {}).get("num_failures") if "stats_total" in last_stats_json else last_stats_json.get("total_failures"),
-                "response_times_avg": {}, # Placeholder for average response times per endpoint
-                "response_times_percentiles": {}, # Placeholder for percentiles
-                "errors": last_stats_json.get("errors", []), # List of errors
-                "state": last_stats_json.get("state") # e.g., "running", "spawning", "stopped"
-            }
-
-            # Extracting response times:
-            # The structure can be flat if stats are simple, or nested if detailed.
-            # If stats are in a list like "stats": [{"name": "GET /path", "avg_response_time": X, ...}, ...]
-            if "stats" in last_stats_json and isinstance(last_stats_json["stats"], list):
-                for stat_entry in last_stats_json["stats"]:
-                    name = stat_entry.get("name", "Aggregated")
-                    if name == "Aggregated" and "stats_total" in last_stats_json : # Prefer stats_total for overall if available
-                        relevant_stats["response_times_avg"]["Total"] = last_stats_json["stats_total"].get("avg_response_time")
-                        # Percentiles might be directly in stats_total or need calculation from raw data (not available here)
-                        for p_key, p_val in last_stats_json["stats_total"].get("percentiles", {}).items():
-                             relevant_stats["response_times_percentiles"].setdefault("Total", {})[p_key] = p_val
-                    else:
-                        relevant_stats["response_times_avg"][f"{stat_entry.get('method', '')} {name}"] = stat_entry.get("avg_response_time")
-                        # Extract percentiles if available per endpoint
-                        for p_key, p_val in stat_entry.get("percentiles", {}).items():
-                             relevant_stats["response_times_percentiles"].setdefault(f"{stat_entry.get('method', '')} {name}", {})[p_key] = p_val
-
-            # Fallback for simpler/older Locust JSON formats or direct stats
-            elif "response_times" in last_stats_json and isinstance(last_stats_json["response_times"], dict):
-                 for name, times in last_stats_json["response_times"].items():
-                     relevant_stats["response_times_avg"][name] = times.get("avg_response_time")
-                     # Add percentiles if they exist in this structure
-                     # This part is highly dependent on Locust's JSON output format
-
-            # If stats_total is present, it's usually the most comprehensive source for totals
-            if "stats_total" in last_stats_json:
-                st = last_stats_json["stats_total"]
-                relevant_stats["total_requests"] = st.get("num_requests")
-                relevant_stats["total_failures"] = st.get("num_failures")
-                relevant_stats["response_times_avg"]["Total"] = st.get("avg_response_time")
-                percentiles_total = {}
-                if "min_response_time" in st: percentiles_total["min"] = st.get("min_response_time")
-                if "max_response_time" in st: percentiles_total["max"] = st.get("max_response_time")
-                if "median_response_time" in st: percentiles_total["median (50th)"] = st.get("median_response_time")
-                # Locust's --json output might not have detailed percentiles like 90th, 95th in stats_total directly in older versions.
-                # The `_stats_history.csv` or HTML report would have more.
-                # For live stats, this might be limited.
-                if "percentiles" in st: # Newer versions might include this
-                     percentiles_total.update(st["percentiles"])
-                if percentiles_total:
-                    relevant_stats["response_times_percentiles"]["Total"] = percentiles_total
-
-
-            return jsonify(relevant_stats), 200
-        else:
-            return jsonify({"message": "No valid stats JSON found in the log file yet.", "test_id": test_id}), 202
-
-    except FileNotFoundError:
-        return jsonify({"error": "Test results or log file not found.", "test_id": test_id}), 404
-    except Exception as e:
-        app.logger.error(f"[{test_id}] Unexpected error in /results/{test_id}/live: {str(e)}")
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}", "test_id": test_id}), 500
+    app.run(debug=True, host='0.0.0.0', port=5001)

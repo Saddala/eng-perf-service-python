@@ -1,5 +1,6 @@
 Flask
+flask-cors
 locust
-jsonpath-ng
 zstandard
 python-dotenv
+jsonpath-ng
